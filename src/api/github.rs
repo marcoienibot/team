@@ -7,7 +7,7 @@ use reqwest::header::{self, HeaderValue};
 use reqwest::{Client, ClientBuilder, RequestBuilder};
 use reqwest::{Method, StatusCode};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 static API_BASE: &str = "https://api.github.com/";
 static TOKEN_VAR: &str = "GITHUB_TOKEN";
@@ -160,6 +160,58 @@ impl GitHubApi {
                 return response.json_annotated().await;
             }
         }
+    }
+
+    /// List workflow files on the repository's default branch.
+    pub(crate) async fn workflow_files(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> Result<HashSet<String>, Error> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            repository: Repository,
+        }
+        #[derive(serde::Deserialize)]
+        struct Repository {
+            object: Option<Tree>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Tree {
+            entries: Vec<TreeEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct TreeEntry {
+            name: String,
+            #[serde(rename = "type")]
+            kind: String,
+        }
+
+        let response: Response = self
+            .graphql(
+                r#"
+                query($org: String!, $repo: String!) {
+                    repository(owner: $org, name: $repo) {
+                        object(expression: "HEAD:.github/workflows") {
+                            ... on Tree {
+                                entries { name type }
+                            }
+                        }
+                    }
+                }
+                "#,
+                serde_json::json!({ "org": org, "repo": repo }),
+            )
+            .await?;
+
+        Ok(response
+            .repository
+            .object
+            .into_iter()
+            .flat_map(|tree| tree.entries)
+            .filter(|entry| entry.kind == "blob")
+            .map(|entry| entry.name)
+            .collect())
     }
 
     pub(crate) async fn usernames(&self, ids: &[u64]) -> Result<HashMap<u64, String>, Error> {

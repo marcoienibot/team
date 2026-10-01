@@ -15,9 +15,15 @@ fn static_api() -> Result<(), Error> {
     }
 
     step("checking whether the data is valid");
-    cmd!(bin(), "check", "--skip", "validate_github_usernames")
-        .dir(dir_valid())
-        .assert_success()?;
+    cmd!(
+        bin(),
+        "check",
+        "--skip",
+        "validate_github_usernames",
+        "validate_trusted_publishing_workflows"
+    )
+    .dir(dir_valid())
+    .assert_success()?;
 
     step("generating the static api contents");
     cmd!(bin(), "static-api", &dir_output)

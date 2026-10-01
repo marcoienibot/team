@@ -609,6 +609,7 @@ the crates can be published from CI, and configure teams that will be able to ya
 # Crates to which the settings below apply. (required)
 crates = ["regex"]
 # Name of a GitHub Actions workflow file that will publish the crates (optional)
+# Must exist in `.github/workflows/` on the repository's default branch.
 # Must be present if `publish-environment` is set.
 publish-workflow = "ci.yml"
 # GitHub Actions environment that has to be used for the publishing (optional)
@@ -621,5 +622,9 @@ teams = ["awesome-team"]
 > [!TIP]
 > To list the public crates of a workspace, run:
 > `cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish == null or .publish == true) | .name'`
+
+Workflow file existence is checked using the GitHub API when `GITHUB_TOKEN` is available,
+including in CI. Merge new workflow files into the repository's default branch before
+configuring them here.
 
 See also the [forge trusted publishing docs](https://forge.rust-lang.org/infra/docs/trusted-publishing.html).

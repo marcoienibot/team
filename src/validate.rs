@@ -6,6 +6,7 @@ use crate::schema::{
     TeamKind, TeamPeople, ZulipMember,
 };
 use anyhow::{Context as _, Error, bail};
+use futures_util::future::LocalBoxFuture;
 use log::{error, warn};
 use regex::Regex;
 use std::collections::hash_map::{Entry, HashMap};
@@ -23,10 +24,10 @@ macro_rules! checks {
 }
 
 macro_rules! async_checks {
-    ($($f:ident,)*) => {
+    ($api:ty; $($f:ident,)*) => {
         [$(
             Check {
-                f: Box::pin($f),
+                f: (|data, api, errors| Box::pin($f(data, api, errors))) as AsyncCheck<$api>,
                 name: stringify!($f)
             }
         ),*]
@@ -84,6 +85,8 @@ struct Check<F> {
     name: &'static str,
 }
 
+type AsyncCheck<A> = for<'a> fn(&'a Data, &'a A, &'a mut Vec<String>) -> LocalBoxFuture<'a, ()>;
+
 pub(crate) async fn validate(data: &Data, strict: bool, skip: &[&str]) -> Result<(), Error> {
     let mut errors = Vec::new();
 
@@ -107,7 +110,10 @@ pub(crate) async fn validate(data: &Data, strict: bool, skip: &[&str]) -> Result
             warn!("cause: {err}");
         }
     } else {
-        let github_checks = async_checks!(validate_github_usernames,);
+        let github_checks = async_checks!(GitHubApi;
+            validate_github_usernames,
+            validate_trusted_publishing_workflows,
+        );
         for check in github_checks {
             if skip.contains(&check.name) {
                 warn!("skipped check: {}", check.name);
@@ -123,7 +129,7 @@ pub(crate) async fn validate(data: &Data, strict: bool, skip: &[&str]) -> Result
         warn!("couldn't perform checks relying on the Zulip API, some errors will not be detected");
         warn!("cause: {err}");
     } else {
-        let zulip_checks = async_checks!(validate_zulip_users,);
+        let zulip_checks = async_checks!(ZulipApi; validate_zulip_users,);
         for check in zulip_checks {
             if skip.contains(&check.name) {
                 warn!("skipped check: {}", check.name);
@@ -1458,6 +1464,52 @@ fn validate_trusted_publishing(data: &Data, errors: &mut Vec<String>) {
     })
 }
 
+/// Ensure trusted publishing references workflow files on the default branch.
+async fn validate_trusted_publishing_workflows(
+    data: &Data,
+    github: &GitHubApi,
+    errors: &mut Vec<String>,
+) {
+    for repo in data.repos() {
+        if !repo
+            .crates_io
+            .iter()
+            .any(|publishing| publishing.workflow_filename.is_some())
+        {
+            continue;
+        }
+
+        match github.workflow_files(&repo.org, &repo.name).await {
+            Ok(workflows) => validate_trusted_publishing_workflow_names(repo, &workflows, errors),
+            Err(err) => errors.push(format!(
+                "couldn't verify trusted publishing workflows for repository `{}/{}`: {err:#}",
+                repo.org, repo.name,
+            )),
+        }
+    }
+}
+
+fn validate_trusted_publishing_workflow_names(
+    repo: &Repo,
+    workflows: &HashSet<String>,
+    errors: &mut Vec<String>,
+) {
+    let configured_workflows: BTreeSet<_> = repo
+        .crates_io
+        .iter()
+        .filter_map(|publishing| publishing.workflow_filename.as_ref())
+        .collect();
+
+    for workflow in configured_workflows {
+        if !workflows.contains(workflow) {
+            errors.push(format!(
+                "Repository `{}/{}` configures trusted publishing with `publish-workflow = \"{workflow}\"`, but `.github/workflows/{workflow}` does not exist on its default branch.",
+                repo.org, repo.name,
+            ));
+        }
+    }
+}
+
 /// Enforce that roles are only assigned to a valid team member, and that the
 /// same role id always has a consistent description across teams (because the
 /// role id becomes the Fluent id used for translation).
@@ -1580,4 +1632,88 @@ fn validate_website(data: &Data, errors: &mut Vec<String>) {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_trusted_publishing_workflow_names;
+    use crate::schema::Repo;
+
+    fn workflow_errors(config: &str, workflows: &[&str]) -> Vec<String> {
+        let repo: Repo = toml::from_str(&format!(
+            "org = 'rust-lang'\nname = 'docs.rs'\ndescription = ''\nbots = []\naccess = {{ teams = {{}} }}\n{config}"
+        ))
+        .unwrap();
+        let workflows = workflows.iter().map(|name| name.to_string()).collect();
+        let mut errors = Vec::new();
+        validate_trusted_publishing_workflow_names(&repo, &workflows, &mut errors);
+        errors
+    }
+
+    #[test]
+    fn trusted_publishing_workflows_exist() {
+        let errors = workflow_errors(
+            r#"
+            [[crates-io]]
+            crates = ["font-awesome-as-a-crate"]
+            publish-workflow = "publish.yml"
+            [[crates-io]]
+            crates = ["docs_rs_crates_io"]
+            publish-workflow = "release.yaml"
+            "#,
+            &["publish.yml", "release.yaml"],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn trusted_publishing_workflow_typo() {
+        let errors = workflow_errors(
+            r#"
+            [[crates-io]]
+            crates = ["font-awesome-as-a-crate", "docs_rs_crates_io"]
+            publish-workflow = "release.yml"
+            "#,
+            &["ci.yml", "publish.yml"],
+        );
+        assert_eq!(
+            errors,
+            [
+                "Repository `rust-lang/docs.rs` configures trusted publishing with `publish-workflow = \"release.yml\"`, but `.github/workflows/release.yml` does not exist on its default branch."
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_publishing_workflows_missing() {
+        let errors = workflow_errors(
+            r#"
+            [[crates-io]]
+            crates = ["one"]
+            publish-workflow = "publish.yml"
+            [[crates-io]]
+            crates = ["two"]
+            publish-workflow = "release.yml"
+            [[crates-io]]
+            crates = ["three"]
+            publish-workflow = "publish.yml"
+            "#,
+            &[],
+        );
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains(".github/workflows/publish.yml"));
+        assert!(errors[1].contains(".github/workflows/release.yml"));
+    }
+
+    #[test]
+    fn trusted_publishing_workflow_not_configured() {
+        let errors = workflow_errors(
+            r#"
+            [[crates-io]]
+            crates = ["docs_rs_crates_io"]
+            "#,
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
 }

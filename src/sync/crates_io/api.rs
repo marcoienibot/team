@@ -501,7 +501,7 @@ pub(crate) struct TrustedPublishingGitHubConfig {
     pub(crate) environment: Option<String>,
 }
 
-#[derive(serde::Deserialize, Debug, Clone)]
+#[derive(serde::Deserialize, Debug)]
 pub(crate) struct CratesIoCrate {
     pub(crate) name: String,
     #[serde(rename = "trustpub_only")]

@@ -143,6 +143,24 @@ impl SyncCratesIo {
 
         // Note: we currently only support one trusted publishing configuration per crate
         for (krate, desired) in &self.crates {
+            let Some(crates_io_crate) = crates.get(&krate.0) else {
+                // We don't own the crate yet, so we only try to accept a pending invitation for it.
+                // Until we own it, we can't see its trusted publishing configs, so a diff computed
+                // now could be wrong (e.g. it could create a duplicate config).
+                // The next sync run will synchronize the rest of the crate.
+                //
+                // Check that the crate exists, to catch typos already in the dry run.
+                self.crates_io_api
+                    .get_crate(krate)
+                    .await
+                    .with_context(|| anyhow::anyhow!("Cannot load crate `{krate}`"))?;
+                crate_diffs.push(CrateDiff::TryAcceptPendingInvitation {
+                    krate: krate.to_string(),
+                    username: self.username.clone(),
+                });
+                continue;
+            };
+
             // Reading trusted publishing configs requires an authenticated token
             // We skip generating a diff for publishing configs on CI when dry-run is enabled,
             // to enable doing a crates.io dry-run without a privileged token.
@@ -204,24 +222,6 @@ impl SyncCratesIo {
                 }
             }
 
-            // If we don't yet own the crate, we want to add a diff to accept an invite for it.
-            let crates_io_crate = match crates.get(&krate.0) {
-                Some(krate) => krate.clone(),
-                None => {
-                    // We insert it at the beginning, because we want to accept invites first,
-                    // before making further changes, otherwise we wouldn't have permission to make
-                    // them.
-                    crate_diffs.insert(
-                        0,
-                        CrateDiff::TryAcceptPendingInvitation {
-                            krate: krate.to_string(),
-                            username: self.username.clone(),
-                        },
-                    );
-                    self.crates_io_api.get_crate(krate).await?
-                }
-            };
-
             // Sync "trusted publishing only" crate option
             if crates_io_crate.trusted_publishing_only != desired.trusted_publishing_only {
                 crate_diffs.push(CrateDiff::SetTrustedPublishingOnly {
@@ -273,30 +273,28 @@ impl SyncCratesIo {
         });
 
         Ok(Diff {
-            crate_diffs,
             config_diffs,
+            crate_diffs,
         })
     }
 }
 
 pub(crate) struct Diff {
-    crate_diffs: Vec<CrateDiff>,
     config_diffs: Vec<ConfigDiff>,
+    crate_diffs: Vec<CrateDiff>,
 }
 
 impl Diff {
     pub(crate) async fn apply(&self, sync: &SyncCratesIo) -> anyhow::Result<()> {
         let Diff {
-            crate_diffs,
             config_diffs,
+            crate_diffs,
         } = self;
 
-        // Apply crate diffs first, to accept potential invites that would then allow us to modify
-        // the configs.
-        for diff in crate_diffs {
+        for diff in config_diffs {
             diff.apply(sync).await?;
         }
-        for diff in config_diffs {
+        for diff in crate_diffs {
             diff.apply(sync).await?;
         }
         Ok(())
